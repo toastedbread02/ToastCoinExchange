@@ -4,9 +4,12 @@ const CORS_HEADERS = {
     "Access-Control-Allow-Headers": "Content-Type"
 };
 
+const FAUCET_TOAST = 1000;
+const FAUCET_CHF = 100;
+const FAUCET_COOLDOWN = 60 * 60; // 1 hour
+
 
 function response(data, status = 200) {
-
     return new Response(
         JSON.stringify(data),
         {
@@ -36,7 +39,6 @@ async function getBalance(env, address) {
         .bind(address)
         .first();
 
-
     if (!balance) {
 
         await env.DB
@@ -48,15 +50,12 @@ async function getBalance(env, address) {
             .bind(address)
             .run();
 
-
         balance = {
             address,
             toast: 0,
             chf: 0
         };
-
     }
-
 
     return balance;
 }
@@ -73,7 +72,6 @@ async function market(env) {
         `)
         .first();
 
-
     const volume = await env.DB
         .prepare(`
             SELECT COALESCE(SUM(amount), 0) AS volume
@@ -83,11 +81,8 @@ async function market(env) {
         .bind(timestamp() - 86400)
         .first();
 
-
     const supply = 1000000;
-
     const price = latest?.price ?? 0;
-
 
     return {
         symbol: "TOAST",
@@ -117,7 +112,6 @@ async function orderBook(env) {
         `)
         .all();
 
-
     const asks = await env.DB
         .prepare(`
             SELECT
@@ -133,7 +127,6 @@ async function orderBook(env) {
         `)
         .all();
 
-
     return {
         bids: bids.results,
         asks: asks.results
@@ -144,23 +137,15 @@ async function orderBook(env) {
 async function history(env, range) {
 
     const ranges = {
-
         "1M": 60 * 60,
-
         "1D": 60 * 60 * 24,
-
         "1MON": 60 * 60 * 24 * 30,
-
         "1Y": 60 * 60 * 24 * 365,
-
         "MAX": 60 * 60 * 24 * 3650
-
     };
-
 
     const seconds =
         ranges[range] ?? ranges["1D"];
-
 
     const result = await env.DB
         .prepare(`
@@ -174,7 +159,6 @@ async function history(env, range) {
         `)
         .bind(timestamp() - seconds)
         .all();
-
 
     return result.results;
 }
@@ -194,7 +178,6 @@ async function recentTrades(env) {
         `)
         .all();
 
-
     return result.results;
 }
 
@@ -208,11 +191,9 @@ async function placeOrder(env, body) {
         price
     } = body;
 
-
     if (!address) {
         throw new Error("Wallet address required");
     }
-
 
     if (
         side !== "buy" &&
@@ -221,10 +202,8 @@ async function placeOrder(env, body) {
         throw new Error("Side must be buy or sell");
     }
 
-
     const quantity = Number(amount);
     const limitPrice = Number(price);
-
 
     if (
         !Number.isFinite(quantity) ||
@@ -233,7 +212,6 @@ async function placeOrder(env, body) {
         throw new Error("Invalid amount");
     }
 
-
     if (
         !Number.isFinite(limitPrice) ||
         limitPrice <= 0
@@ -241,40 +219,31 @@ async function placeOrder(env, body) {
         throw new Error("Invalid price");
     }
 
-
     const balance =
         await getBalance(env, address);
-
 
     if (side === "buy") {
 
         const requiredCHF =
             quantity * limitPrice;
 
-
         if (balance.chf < requiredCHF) {
 
             throw new Error(
-                `Insufficient CHF. You need ${requiredCHF.toFixed(4)} CHF.`
+                `Insufficient test CHF. You need ${requiredCHF.toFixed(4)} CHF.`
             );
-
         }
-
     }
-
 
     if (side === "sell") {
 
         if (balance.toast < quantity) {
 
             throw new Error(
-                `Insufficient TOAST. You have ${balance.toast}.`
+                `Insufficient test TOAST. You have ${balance.toast}.`
             );
-
         }
-
     }
-
 
     const result = await env.DB
         .prepare(`
@@ -300,16 +269,13 @@ async function placeOrder(env, body) {
         )
         .run();
 
-
     const orderId =
         result.meta.last_row_id;
-
 
     await matchOrders(
         env,
         orderId
     );
-
 
     return {
         success: true,
@@ -329,16 +295,13 @@ async function matchOrders(env, orderId) {
         .bind(orderId)
         .first();
 
-
     if (!order) {
         return;
     }
 
-
     while (order.remaining > 0) {
 
         let match;
-
 
         if (order.side === "buy") {
 
@@ -379,14 +342,11 @@ async function matchOrders(env, orderId) {
                     order.address
                 )
                 .first();
-
         }
-
 
         if (!match) {
             break;
         }
-
 
         const amount =
             Math.min(
@@ -394,26 +354,21 @@ async function matchOrders(env, orderId) {
                 match.remaining
             );
 
-
         const tradePrice =
             match.price;
-
 
         const buyer =
             order.side === "buy"
                 ? order
                 : match;
 
-
         const seller =
             order.side === "sell"
                 ? order
                 : match;
 
-
         const cost =
             amount * tradePrice;
-
 
         const buyerBalance =
             await getBalance(
@@ -421,13 +376,11 @@ async function matchOrders(env, orderId) {
                 buyer.address
             );
 
-
         const sellerBalance =
             await getBalance(
                 env,
                 seller.address
             );
-
 
         if (
             buyerBalance.chf < cost ||
@@ -446,10 +399,8 @@ async function matchOrders(env, orderId) {
             continue;
         }
 
-
         await env.DB.batch([
 
-            // Buyer
             env.DB
                 .prepare(`
                     UPDATE balances
@@ -464,7 +415,6 @@ async function matchOrders(env, orderId) {
                     buyer.address
                 ),
 
-            // Seller
             env.DB
                 .prepare(`
                     UPDATE balances
@@ -479,7 +429,6 @@ async function matchOrders(env, orderId) {
                     seller.address
                 ),
 
-            // Current order
             env.DB
                 .prepare(`
                     UPDATE orders
@@ -499,7 +448,6 @@ async function matchOrders(env, orderId) {
                     order.id
                 ),
 
-            // Matched order
             env.DB
                 .prepare(`
                     UPDATE orders
@@ -519,7 +467,6 @@ async function matchOrders(env, orderId) {
                     match.id
                 ),
 
-            // Trade
             env.DB
                 .prepare(`
                     INSERT INTO trades
@@ -540,7 +487,6 @@ async function matchOrders(env, orderId) {
                     timestamp()
                 ),
 
-            // Price history
             env.DB
                 .prepare(`
                     INSERT INTO price_history
@@ -556,13 +502,91 @@ async function matchOrders(env, orderId) {
                     amount,
                     timestamp()
                 )
-
         ]);
 
-
         order.remaining -= amount;
-
     }
+}
+
+
+async function faucet(env, address) {
+
+    if (!address) {
+        throw new Error("Wallet address required");
+    }
+
+    const currentTime = timestamp();
+
+    const existing = await env.DB
+        .prepare(`
+            SELECT address, last_claim
+            FROM faucet_claims
+            WHERE address = ?
+        `)
+        .bind(address)
+        .first();
+
+    if (existing) {
+
+        const elapsed =
+            currentTime - existing.last_claim;
+
+        if (elapsed < FAUCET_COOLDOWN) {
+
+            const remaining =
+                FAUCET_COOLDOWN - elapsed;
+
+            return {
+                success: false,
+                cooldown: remaining
+            };
+        }
+    }
+
+    await getBalance(
+        env,
+        address
+    );
+
+    await env.DB.batch([
+
+        env.DB
+            .prepare(`
+                UPDATE balances
+                SET
+                    toast = toast + ?,
+                    chf = chf + ?
+                WHERE address = ?
+            `)
+            .bind(
+                FAUCET_TOAST,
+                FAUCET_CHF,
+                address
+            ),
+
+        env.DB
+            .prepare(`
+                INSERT INTO faucet_claims
+                (
+                    address,
+                    last_claim
+                )
+                VALUES (?, ?)
+                ON CONFLICT(address)
+                DO UPDATE SET
+                    last_claim = excluded.last_claim
+            `)
+            .bind(
+                address,
+                currentTime
+            )
+    ]);
+
+    return {
+        success: true,
+        toast: FAUCET_TOAST,
+        chf: FAUCET_CHF
+    };
 }
 
 
@@ -577,17 +601,11 @@ export default {
                 return new Response(null, {
                     headers: CORS_HEADERS
                 });
-
             }
-
 
             const url =
                 new URL(request.url);
 
-
-            // ------------------------------------------
-            // HOME
-            // ------------------------------------------
 
             if (url.pathname === "/") {
 
@@ -595,15 +613,11 @@ export default {
                     name: "ToastCoin Exchange",
                     symbol: "TOAST",
                     status: "online",
+                    network: "testnet",
                     message: "Proof of Toast"
                 });
-
             }
 
-
-            // ------------------------------------------
-            // MARKET
-            // ------------------------------------------
 
             if (
                 url.pathname === "/api/market"
@@ -613,13 +627,8 @@ export default {
                 return response(
                     await market(env)
                 );
-
             }
 
-
-            // ------------------------------------------
-            // HISTORY
-            // ------------------------------------------
 
             if (
                 url.pathname === "/api/history"
@@ -630,7 +639,6 @@ export default {
                     url.searchParams.get("range")
                     || "1D";
 
-
                 return response({
                     range,
                     data:
@@ -639,13 +647,8 @@ export default {
                             range
                         )
                 });
-
             }
 
-
-            // ------------------------------------------
-            // ORDER BOOK
-            // ------------------------------------------
 
             if (
                 url.pathname === "/api/orderbook"
@@ -655,13 +658,8 @@ export default {
                 return response(
                     await orderBook(env)
                 );
-
             }
 
-
-            // ------------------------------------------
-            // TRADES
-            // ------------------------------------------
 
             if (
                 url.pathname === "/api/trades"
@@ -672,13 +670,8 @@ export default {
                     trades:
                         await recentTrades(env)
                 });
-
             }
 
-
-            // ------------------------------------------
-            // BALANCE
-            // ------------------------------------------
 
             if (
                 url.pathname === "/api/balance"
@@ -690,16 +683,13 @@ export default {
                         "address"
                     );
 
-
                 if (!address) {
 
                     return response({
                         error:
                             "Address required"
                     }, 400);
-
                 }
-
 
                 return response(
                     await getBalance(
@@ -707,13 +697,25 @@ export default {
                         address
                     )
                 );
-
             }
 
 
-            // ------------------------------------------
-            // PLACE ORDER
-            // ------------------------------------------
+            if (
+                url.pathname === "/api/faucet"
+                && request.method === "POST"
+            ) {
+
+                const body =
+                    await request.json();
+
+                return response(
+                    await faucet(
+                        env,
+                        body.address
+                    )
+                );
+            }
+
 
             if (
                 url.pathname === "/api/order"
@@ -723,14 +725,12 @@ export default {
                 const body =
                     await request.json();
 
-
                 return response(
                     await placeOrder(
                         env,
                         body
                     )
                 );
-
             }
 
 
@@ -744,9 +744,6 @@ export default {
             return response({
                 error: error.message
             }, 500);
-
         }
-
     }
-
 };
