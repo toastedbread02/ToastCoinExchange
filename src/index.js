@@ -1,12 +1,12 @@
 export default {
     async fetch(request, env) {
+
+        const result = await env.DB
+            .prepare("SELECT 1 AS toast")
+            .first();
+
         return new Response(
-            JSON.stringify({
-                name: "ToastCoin Exchange",
-                symbol: "TOAST",
-                status: "online",
-                message: "Proof of Toast 🍞"
-            }),
+            JSON.stringify(result),
             {
                 headers: {
                     "Content-Type": "application/json"
