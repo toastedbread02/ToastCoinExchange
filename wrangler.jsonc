@@ -2,5 +2,13 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "toastcoin-exchange",
   "main": "src/index.js",
-  "compatibility_date": "2026-08-09"
+  "compatibility_date": "2026-08-09",
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "toastcoin-market",
+      "database_id": "a3293756-3e99-4f99-a93e-717970b69b87"
+    }
+  ]
 }
