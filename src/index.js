@@ -1,12 +1,12 @@
 const CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type"
 };
 
 const FAUCET_TOAST = 1000;
 const FAUCET_CHF = 100;
-const FAUCET_COOLDOWN = 60 * 60; // 1 hour
+const FAUCET_COOLDOWN = 60 * 60;
 
 
 function response(data, status = 200) {
@@ -23,7 +23,7 @@ function response(data, status = 200) {
 }
 
 
-function timestamp() {
+function now() {
     return Math.floor(Date.now() / 1000);
 }
 
@@ -32,7 +32,12 @@ async function getBalance(env, address) {
 
     let balance = await env.DB
         .prepare(`
-            SELECT address, toast, chf
+            SELECT
+                address,
+                toast,
+                chf,
+                toast_locked,
+                chf_locked
             FROM balances
             WHERE address = ?
         `)
@@ -44,8 +49,14 @@ async function getBalance(env, address) {
         await env.DB
             .prepare(`
                 INSERT INTO balances
-                (address, toast, chf)
-                VALUES (?, 0, 0)
+                (
+                    address,
+                    toast,
+                    chf,
+                    toast_locked,
+                    chf_locked
+                )
+                VALUES (?, 0, 0, 0, 0)
             `)
             .bind(address)
             .run();
@@ -53,7 +64,9 @@ async function getBalance(env, address) {
         balance = {
             address,
             toast: 0,
-            chf: 0
+            chf: 0,
+            toast_locked: 0,
+            chf_locked: 0
         };
     }
 
@@ -78,7 +91,7 @@ async function market(env) {
             FROM trades
             WHERE timestamp >= ?
         `)
-        .bind(timestamp() - 86400)
+        .bind(now() - 86400)
         .first();
 
     const supply = 1000000;
@@ -144,8 +157,7 @@ async function history(env, range) {
         "MAX": 60 * 60 * 24 * 3650
     };
 
-    const seconds =
-        ranges[range] ?? ranges["1D"];
+    const seconds = ranges[range] ?? ranges["1D"];
 
     const result = await env.DB
         .prepare(`
@@ -157,7 +169,7 @@ async function history(env, range) {
             WHERE timestamp >= ?
             ORDER BY timestamp ASC
         `)
-        .bind(timestamp() - seconds)
+        .bind(now() - seconds)
         .all();
 
     return result.results;
@@ -184,66 +196,82 @@ async function recentTrades(env) {
 
 async function placeOrder(env, body) {
 
-    const {
-        address,
-        side,
-        amount,
-        price
-    } = body;
+    const address = String(body.address || "").trim();
+    const side = body.side;
+    const amount = Number(body.amount);
+    const price = Number(body.price);
 
     if (!address) {
         throw new Error("Wallet address required");
     }
 
-    if (
-        side !== "buy" &&
-        side !== "sell"
-    ) {
+    if (side !== "buy" && side !== "sell") {
         throw new Error("Side must be buy or sell");
     }
 
-    const quantity = Number(amount);
-    const limitPrice = Number(price);
-
-    if (
-        !Number.isFinite(quantity) ||
-        quantity <= 0
-    ) {
+    if (!Number.isFinite(amount) || amount <= 0) {
         throw new Error("Invalid amount");
     }
 
-    if (
-        !Number.isFinite(limitPrice) ||
-        limitPrice <= 0
-    ) {
+    if (!Number.isFinite(price) || price <= 0) {
         throw new Error("Invalid price");
     }
 
-    const balance =
-        await getBalance(env, address);
-
-    if (side === "buy") {
-
-        const requiredCHF =
-            quantity * limitPrice;
-
-        if (balance.chf < requiredCHF) {
-
-            throw new Error(
-                `Insufficient test CHF. You need ${requiredCHF.toFixed(4)} CHF.`
-            );
-        }
-    }
+    const balance = await getBalance(env, address);
 
     if (side === "sell") {
 
-        if (balance.toast < quantity) {
-
+        if (balance.toast < amount) {
             throw new Error(
-                `Insufficient test TOAST. You have ${balance.toast}.`
+                `Insufficient TOAST. Available: ${balance.toast}`
             );
         }
+
+        await env.DB
+            .prepare(`
+                UPDATE balances
+                SET
+                    toast = toast - ?,
+                    toast_locked = toast_locked + ?
+                WHERE address = ?
+                  AND toast >= ?
+            `)
+            .bind(
+                amount,
+                amount,
+                address,
+                amount
+            )
+            .run();
+
+    } else {
+
+        const required = amount * price;
+
+        if (balance.chf < required) {
+            throw new Error(
+                `Insufficient CHF. Available: ${balance.chf}`
+            );
+        }
+
+        await env.DB
+            .prepare(`
+                UPDATE balances
+                SET
+                    chf = chf - ?,
+                    chf_locked = chf_locked + ?
+                WHERE address = ?
+                  AND chf >= ?
+            `)
+            .bind(
+                required,
+                required,
+                address,
+                required
+            )
+            .run();
     }
+
 
     const result = await env.DB
         .prepare(`
@@ -262,20 +290,17 @@ async function placeOrder(env, body) {
         .bind(
             address,
             side,
-            quantity,
-            quantity,
-            limitPrice,
-            timestamp()
+            amount,
+            amount,
+            price,
+            now()
         )
         .run();
 
-    const orderId =
-        result.meta.last_row_id;
 
-    await matchOrders(
-        env,
-        orderId
-    );
+    const orderId = result.meta.last_row_id;
+
+    await matchOrders(env, orderId);
 
     return {
         success: true,
@@ -286,7 +311,7 @@ async function placeOrder(env, body) {
 
 async function matchOrders(env, orderId) {
 
-    const order = await env.DB
+    let order = await env.DB
         .prepare(`
             SELECT *
             FROM orders
@@ -299,9 +324,11 @@ async function matchOrders(env, orderId) {
         return;
     }
 
+
     while (order.remaining > 0) {
 
         let match;
+
 
         if (order.side === "buy") {
 
@@ -344,18 +371,21 @@ async function matchOrders(env, orderId) {
                 .first();
         }
 
+
         if (!match) {
             break;
         }
 
-        const amount =
-            Math.min(
-                order.remaining,
-                match.remaining
-            );
 
-        const tradePrice =
-            match.price;
+        const amount = Math.min(
+            order.remaining,
+            match.remaining
+        );
+
+
+        // The older resting order determines
+        // the execution price.
+        const tradePrice = match.price;
 
         const buyer =
             order.side === "buy"
@@ -367,68 +397,63 @@ async function matchOrders(env, orderId) {
                 ? order
                 : match;
 
-        const cost =
-            amount * tradePrice;
+        const cost = amount * tradePrice;
 
-        const buyerBalance =
-            await getBalance(
-                env,
-                buyer.address
-            );
 
-        const sellerBalance =
-            await getBalance(
-                env,
-                seller.address
-            );
+        /*
+         * Buyer reserved money at their LIMIT price.
+         *
+         * If they bought cheaper than their limit,
+         * the difference gets unlocked.
+         */
 
-        if (
-            buyerBalance.chf < cost ||
-            sellerBalance.toast < amount
-        ) {
+        let buyerReserved = 0;
 
-            await env.DB
-                .prepare(`
-                    UPDATE orders
-                    SET status = 'cancelled'
-                    WHERE id = ?
-                `)
-                .bind(match.id)
-                .run();
-
-            continue;
+        if (buyer.side === "buy") {
+            buyerReserved = amount * buyer.price;
         }
+
+
+        const buyerRefund =
+            buyerReserved - cost;
+
 
         await env.DB.batch([
 
+            // Buyer receives TOAST.
             env.DB
                 .prepare(`
                     UPDATE balances
                     SET
-                        chf = chf - ?,
-                        toast = toast + ?
+                        toast = toast + ?,
+                        chf_locked = chf_locked - ? + ?
                     WHERE address = ?
                 `)
                 .bind(
-                    cost,
                     amount,
+                    buyerReserved,
+                    buyerRefund,
                     buyer.address
                 ),
 
+
+            // Seller receives CHF.
             env.DB
                 .prepare(`
                     UPDATE balances
                     SET
-                        toast = toast - ?,
-                        chf = chf + ?
+                        chf = chf + ?,
+                        toast_locked = toast_locked - ?
                     WHERE address = ?
                 `)
                 .bind(
-                    amount,
                     cost,
+                    amount,
                     seller.address
                 ),
 
+
+            // Current order.
             env.DB
                 .prepare(`
                     UPDATE orders
@@ -448,6 +473,8 @@ async function matchOrders(env, orderId) {
                     order.id
                 ),
 
+
+            // Matching order.
             env.DB
                 .prepare(`
                     UPDATE orders
@@ -467,6 +494,8 @@ async function matchOrders(env, orderId) {
                     match.id
                 ),
 
+
+            // Trade history.
             env.DB
                 .prepare(`
                     INSERT INTO trades
@@ -484,9 +513,11 @@ async function matchOrders(env, orderId) {
                     seller.id,
                     amount,
                     tradePrice,
-                    timestamp()
+                    now()
                 ),
 
+
+            // Chart history.
             env.DB
                 .prepare(`
                     INSERT INTO price_history
@@ -500,53 +531,180 @@ async function matchOrders(env, orderId) {
                 .bind(
                     tradePrice,
                     amount,
-                    timestamp()
+                    now()
                 )
         ]);
 
+
         order.remaining -= amount;
+
+
+        order = await env.DB
+            .prepare(`
+                SELECT *
+                FROM orders
+                WHERE id = ?
+            `)
+            .bind(orderId)
+            .first();
+
+
+        if (!order) {
+            break;
+        }
     }
+}
+
+
+async function cancelOrder(env, address, orderId) {
+
+    const order = await env.DB
+        .prepare(`
+            SELECT *
+            FROM orders
+            WHERE id = ?
+              AND address = ?
+              AND status = 'open'
+        `)
+        .bind(
+            orderId,
+            address
+        )
+        .first();
+
+
+    if (!order) {
+        throw new Error(
+            "Open order not found"
+        );
+    }
+
+
+    if (order.remaining <= 0) {
+        throw new Error(
+            "Order is already filled"
+        );
+    }
+
+
+    const remaining = order.remaining;
+
+
+    if (order.side === "sell") {
+
+        await env.DB.batch([
+
+            env.DB
+                .prepare(`
+                    UPDATE balances
+                    SET
+                        toast = toast + ?,
+                        toast_locked = toast_locked - ?
+                    WHERE address = ?
+                `)
+                .bind(
+                    remaining,
+                    remaining,
+                    address
+                ),
+
+            env.DB
+                .prepare(`
+                    UPDATE orders
+                    SET
+                        status = 'cancelled',
+                        remaining = 0
+                    WHERE id = ?
+                `)
+                .bind(orderId)
+
+        ]);
+
+    } else {
+
+        const refund =
+            remaining * order.price;
+
+        await env.DB.batch([
+
+            env.DB
+                .prepare(`
+                    UPDATE balances
+                    SET
+                        chf = chf + ?,
+                        chf_locked = chf_locked - ?
+                    WHERE address = ?
+                `)
+                .bind(
+                    refund,
+                    refund,
+                    address
+                ),
+
+            env.DB
+                .prepare(`
+                    UPDATE orders
+                    SET
+                        status = 'cancelled',
+                        remaining = 0
+                    WHERE id = ?
+                `)
+                .bind(orderId)
+
+        ]);
+    }
+
+
+    return {
+        success: true
+    };
 }
 
 
 async function faucet(env, address) {
 
     if (!address) {
-        throw new Error("Wallet address required");
+        throw new Error(
+            "Wallet address required"
+        );
     }
 
-    const currentTime = timestamp();
+
+    const current = now();
+
 
     const existing = await env.DB
         .prepare(`
-            SELECT address, last_claim
+            SELECT *
             FROM faucet_claims
             WHERE address = ?
         `)
         .bind(address)
         .first();
 
+
     if (existing) {
 
         const elapsed =
-            currentTime - existing.last_claim;
+            current - existing.last_claim;
+
 
         if (elapsed < FAUCET_COOLDOWN) {
 
-            const remaining =
-                FAUCET_COOLDOWN - elapsed;
-
             return {
                 success: false,
-                cooldown: remaining
+                cooldown:
+                    FAUCET_COOLDOWN - elapsed
             };
         }
     }
+
 
     await getBalance(
         env,
         address
     );
+
 
     await env.DB.batch([
 
@@ -564,6 +722,7 @@ async function faucet(env, address) {
                 address
             ),
 
+
         env.DB
             .prepare(`
                 INSERT INTO faucet_claims
@@ -572,15 +731,18 @@ async function faucet(env, address) {
                     last_claim
                 )
                 VALUES (?, ?)
+
                 ON CONFLICT(address)
                 DO UPDATE SET
-                    last_claim = excluded.last_claim
+                    last_claim =
+                        excluded.last_claim
             `)
             .bind(
                 address,
-                currentTime
+                current
             )
     ]);
+
 
     return {
         success: true,
@@ -603,6 +765,7 @@ export default {
                 });
             }
 
+
             const url =
                 new URL(request.url);
 
@@ -612,18 +775,17 @@ export default {
                 return response({
                     name: "ToastCoin Exchange",
                     symbol: "TOAST",
+                    network: "TESTNET",
                     status: "online",
-                    network: "testnet",
                     message: "Proof of Toast"
                 });
             }
 
 
             if (
-                url.pathname === "/api/market"
-                && request.method === "GET"
+                url.pathname === "/api/market" &&
+                request.method === "GET"
             ) {
-
                 return response(
                     await market(env)
                 );
@@ -631,30 +793,31 @@ export default {
 
 
             if (
-                url.pathname === "/api/history"
-                && request.method === "GET"
+                url.pathname === "/api/history" &&
+                request.method === "GET"
             ) {
 
-                const range =
-                    url.searchParams.get("range")
-                    || "1D";
-
                 return response({
-                    range,
+                    range:
+                        url.searchParams.get(
+                            "range"
+                        ) || "1D",
+
                     data:
                         await history(
                             env,
-                            range
+                            url.searchParams.get(
+                                "range"
+                            ) || "1D"
                         )
                 });
             }
 
 
             if (
-                url.pathname === "/api/orderbook"
-                && request.method === "GET"
+                url.pathname === "/api/orderbook" &&
+                request.method === "GET"
             ) {
-
                 return response(
                     await orderBook(env)
                 );
@@ -662,10 +825,9 @@ export default {
 
 
             if (
-                url.pathname === "/api/trades"
-                && request.method === "GET"
+                url.pathname === "/api/trades" &&
+                request.method === "GET"
             ) {
-
                 return response({
                     trades:
                         await recentTrades(env)
@@ -674,8 +836,8 @@ export default {
 
 
             if (
-                url.pathname === "/api/balance"
-                && request.method === "GET"
+                url.pathname === "/api/balance" &&
+                request.method === "GET"
             ) {
 
                 const address =
@@ -683,13 +845,14 @@ export default {
                         "address"
                     );
 
-                if (!address) {
 
+                if (!address) {
                     return response({
                         error:
                             "Address required"
                     }, 400);
                 }
+
 
                 return response(
                     await getBalance(
@@ -701,12 +864,13 @@ export default {
 
 
             if (
-                url.pathname === "/api/faucet"
-                && request.method === "POST"
+                url.pathname === "/api/faucet" &&
+                request.method === "POST"
             ) {
 
                 const body =
                     await request.json();
+
 
                 return response(
                     await faucet(
@@ -718,17 +882,37 @@ export default {
 
 
             if (
-                url.pathname === "/api/order"
-                && request.method === "POST"
+                url.pathname === "/api/order" &&
+                request.method === "POST"
             ) {
 
                 const body =
                     await request.json();
 
+
                 return response(
                     await placeOrder(
                         env,
                         body
+                    )
+                );
+            }
+
+
+            if (
+                url.pathname === "/api/order" &&
+                request.method === "DELETE"
+            ) {
+
+                const body =
+                    await request.json();
+
+
+                return response(
+                    await cancelOrder(
+                        env,
+                        body.address,
+                        Number(body.orderId)
                     )
                 );
             }
