@@ -340,6 +340,39 @@ async function getBalance(env, address) {
     return balance;
 }
 
+/*
+ * Open orders for one address, newest first, so a wallet can list and
+ * cancel its own resting orders. The market maker's quotes sit on its own
+ * reserved address, so they never show up here.
+ */
+async function openOrders(env, address) {
+    const rows = await env.DB.prepare(`
+        SELECT
+            id,
+            side,
+            price,
+            amount,
+            remaining,
+            created_at
+        FROM orders
+        WHERE address = ?
+          AND status = 'open'
+          AND remaining > 0
+        ORDER BY id DESC
+        LIMIT 50
+    `).bind(address).all();
+
+    return (rows.results || []).map(row => ({
+        id: row.id,
+        side: row.side,
+        price: row.price,
+        amount: row.amount,
+        remaining: row.remaining,
+        createdAt: row.created_at
+    }));
+}
+
+
 async function market(env) {
     await ensureMarket(env);
 
@@ -621,16 +654,21 @@ async function matchOrders(env, orderId) {
             buyerReserved - cost;
 
         await env.DB.batch([
+            // The buyer reserved amount * limit price. Release the whole
+            // reservation and return the difference between that and the
+            // executed cost to the available balance; leaving the refund
+            // in chf_locked stranded the money once the order was filled.
             env.DB.prepare(`
                 UPDATE balances
                 SET
                     toast = toast + ?,
-                    chf_locked = chf_locked - ? + ?
+                    chf = chf + ?,
+                    chf_locked = chf_locked - ?
                 WHERE address = ?
             `).bind(
                 amount,
-                buyerReserved,
                 buyerRefund,
+                buyerReserved,
                 buyer.address
             ),
 
@@ -980,6 +1018,34 @@ export default {
                         address
                     )
                 );
+            }
+
+            if (
+                url.pathname === "/api/orders" &&
+                request.method === "GET"
+            ) {
+                const address =
+                    url.searchParams.get(
+                        "address"
+                    );
+
+                if (!address) {
+                    return response(
+                        {
+                            error:
+                                "Address required"
+                        },
+                        400
+                    );
+                }
+
+                return response({
+                    orders:
+                        await openOrders(
+                            env,
+                            address
+                        )
+                });
             }
 
             if (

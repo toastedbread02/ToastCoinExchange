@@ -1,0 +1,2 @@
+# Local Wrangler/miniflare state (bindings, caches, dev database).
+.wrangler/
