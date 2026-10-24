@@ -15,6 +15,13 @@ const START_PRICE = 0.01;
  * Its address is rejected by the user-facing endpoints.
  */
 const MARKET_MAKER = "mm:toast-liquidity-provider";
+
+/*
+ * Reported alongside circulating supply. Minting is not capped against
+ * it yet, so treat it as the advertised ceiling rather than a limit.
+ */
+const MAX_SUPPLY = 1000000;
+
 const MM_START_TOAST = 500000;
 const MM_START_CHF = 500000;
 const MM_LEVELS = 6;
@@ -373,6 +380,50 @@ async function openOrders(env, address) {
 }
 
 
+/*
+ * Minted TOAST actually held by wallets. Faucet claims and mining rewards
+ * add to this, so supply rises as the testnet mints. The liquidity
+ * provider is protocol-owned, not circulating, so it is excluded.
+ */
+async function circulatingSupply(env) {
+    const row = await env.DB.prepare(`
+        SELECT COALESCE(SUM(toast + toast_locked), 0) AS supply
+        FROM balances
+        WHERE address NOT LIKE 'mm:%'
+    `).first();
+
+    /*
+     * REAL arithmetic leaves noise like 8107.500000000002; trim it so
+     * clients do not have to.
+     */
+    return Number(Number(row?.supply || 0).toFixed(6));
+}
+
+
+/*
+ * Percentage move against the newest price at least 24 hours old. When the
+ * market has not traded in a day the last known price before that window is
+ * used, which is what a ticker shows for a quiet market.
+ */
+async function change24h(env, price) {
+    const prior = await env.DB.prepare(`
+        SELECT price
+        FROM price_history
+        WHERE timestamp <= ?
+        ORDER BY timestamp DESC
+        LIMIT 1
+    `).bind(now() - 86400).first();
+
+    const base = Number(prior?.price || 0);
+
+    if (!base || !price) {
+        return null;
+    }
+
+    return Number((((price - base) / base) * 100).toFixed(4));
+}
+
+
 async function market(env) {
     await ensureMarket(env);
 
@@ -382,16 +433,19 @@ async function market(env) {
         WHERE timestamp >= ?
     `).bind(now() - 86400).first();
 
-    const supply = 1000000;
+    const supply = await circulatingSupply(env);
     const price = await lastPrice(env);
+    const change = await change24h(env, price);
 
     return {
         symbol: "TOAST",
         currency: "CHF",
         price,
-        volume24h: volume?.volume ?? 0,
+        change24h: change,
+        volume24h: Number(Number(volume?.volume ?? 0).toFixed(6)),
         supply,
-        marketCap: price * supply
+        maxSupply: MAX_SUPPLY,
+        marketCap: Number((price * supply).toFixed(6))
     };
 }
 
